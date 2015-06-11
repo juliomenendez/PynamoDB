@@ -5,6 +5,7 @@ import logging
 
 import six
 from botocore.session import get_session
+from botocore.exceptions import ClientError, BotoCoreError
 
 from .util import pythonic
 from ..types import HASH, RANGE
@@ -27,6 +28,7 @@ from pynamodb.constants import (
     CONSUMED_CAPACITY, CAPACITY_UNITS, QUERY_FILTER, QUERY_FILTER_VALUES, CONDITIONAL_OPERATOR,
     CONDITIONAL_OPERATORS, NULL, NOT_NULL, SHORT_ATTR_TYPES
 )
+from .util import pythonic, unpythonic
 
 
 log = logging.getLogger(__name__)
@@ -173,7 +175,7 @@ class Connection(object):
             self.region = DEFAULT_REGION
 
     def __repr__(self):
-        return six.u("Connection<{0}>".format(self.endpoint.host))
+        return six.u("Connection<{0}>".format(self.client))
 
     def _log_debug(self, operation, kwargs):
         """
@@ -210,22 +212,26 @@ class Connection(object):
             if pythonic(RETURN_CONSUMED_CAPACITY) not in operation_kwargs:
                 operation_kwargs.update(self.get_consumed_capacity_map(TOTAL))
         self._log_debug(operation_name, operation_kwargs)
-        response, data = self.service.get_operation(operation_name).call(self.endpoint, **operation_kwargs)
-        if not response.ok:
-            self._log_error(operation_name, response)
-        if data and CONSUMED_CAPACITY in data:
-            capacity = data.get(CONSUMED_CAPACITY)
-            if isinstance(capacity, dict) and CAPACITY_UNITS in capacity:
-                capacity = capacity.get(CAPACITY_UNITS)
-            log.debug(
-                "{0} {1} consumed {2} units".format(
-                    data.get(TABLE_NAME, ''),
-                    operation_name,
-                    capacity
+        try:
+            data = getattr(self.client, pythonic(operation_name))(**dict(
+                (unpythonic(key), value) for key, value in operation_kwargs.items()
+            ))
+            if data and CONSUMED_CAPACITY in data:
+                capacity = data.get(CONSUMED_CAPACITY)
+                if isinstance(capacity, dict) and CAPACITY_UNITS in capacity:
+                    capacity = capacity.get(CAPACITY_UNITS)
+                log.debug(
+                    "{0} {1} consumed {2} units".format(
+                        data.get(TABLE_NAME, ''),
+                        operation_name,
+                        capacity
+                    )
                 )
-            )
-        self._log_debug_response(operation_kwargs, response)
-        return response, data
+            # self._log_debug_response(operation_kwargs, response) FIXME
+            return data
+        except ClientError:
+            # self._log_error(operation_name, response) FIXME
+            raise
 
     @property
     def session(self):
@@ -237,22 +243,20 @@ class Connection(object):
         return self._session
 
     @property
+    def client(self):
+        """
+        Returns a reference to the dynamodb client
+        """
+        return self.session.create_client(SERVICE_NAME, region_name=self.region)
+
+    @property
     def service(self):
         """
         Returns a reference to the dynamodb service
         """
         return self.session.get_service(SERVICE_NAME)
 
-    @property
-    def endpoint(self):
-        """
-        Returns an endpoint connection to `self.region`
-        """
-        if self.host:
-            end_point = self.service.get_endpoint(self.region, endpoint_url=self.host)
-        else:
-            end_point = self.service.get_endpoint(self.region)
-        return end_point
+    # FIME?? is endpoint still needed? 
 
     def get_meta_table(self, table_name, refresh=False):
         """
@@ -262,12 +266,12 @@ class Connection(object):
             operation_kwargs = {
                 pythonic(TABLE_NAME): table_name
             }
-            response, data = self.dispatch(DESCRIBE_TABLE, operation_kwargs)
-            if not response.ok:
-                if response.status_code == HTTP_BAD_REQUEST:
-                    return None
-                else:
-                    raise TableError("Unable to describe table: {0}".format(response.content))
+            try:
+                data = self.dispatch(DESCRIBE_TABLE, operation_kwargs)
+            except ClientError:
+                return None
+            except BotoCoreError as e:
+                raise TableError("Unable to describe table: {0}".format(e))
             self._tables[table_name] = MetaTable(data.get(TABLE_KEY))
         return self._tables[table_name]
 
@@ -325,14 +329,15 @@ class Connection(object):
             for index in local_secondary_indexes:
                 local_secondary_indexes_list.append({
                     INDEX_NAME: index.get(pythonic(INDEX_NAME)),
-                    KEY_SCHEMA: sorted(index.get(pythonic(KEY_SCHEMA)), key=lambda x: x.get(KEY_TYPE)), 
+                    KEY_SCHEMA: sorted(index.get(pythonic(KEY_SCHEMA)), key=lambda x: x.get(KEY_TYPE)),
                     PROJECTION: index.get(pythonic(PROJECTION)),
                 })
             operation_kwargs[pythonic(LOCAL_SECONDARY_INDEXES)] = local_secondary_indexes_list
-        response, data = self.dispatch(CREATE_TABLE, operation_kwargs)
-        if response.status_code != HTTP_OK:
-            raise TableError("Failed to create table: {0}".format(response.content))
-        return data
+        try:
+            return self.dispatch(CREATE_TABLE, operation_kwargs)
+        except (ClientError, BotoCoreError) as e:
+            raise TableError("Failed to create table: {0}".format(e))
+
 
     def delete_table(self, table_name):
         """
@@ -341,10 +346,10 @@ class Connection(object):
         operation_kwargs = {
             pythonic(TABLE_NAME): table_name
         }
-        response, data = self.dispatch(DELETE_TABLE, operation_kwargs)
-        if response.status_code != HTTP_OK:
-            raise TableError("Failed to delete table: {0}".format(response.content))
-        return data
+        try:
+            return self.dispatch(DELETE_TABLE, operation_kwargs)
+        except (ClientError, BotoCoreError) as e:
+            raise TableError("Failed to delete table: {0}".format(e))
 
     def update_table(self,
                      table_name,
@@ -377,9 +382,10 @@ class Connection(object):
                     }
                 })
             operation_kwargs[pythonic(GLOBAL_SECONDARY_INDEX_UPDATES)] = global_secondary_indexes_list
-        response, data = self.dispatch(UPDATE_TABLE, operation_kwargs)
-        if not response.ok:
-            raise TableError("Failed to update table: {0}".format(response.content))
+        try:
+            data = self.dispatch(UPDATE_TABLE, operation_kwargs)
+        except (ClientError, BotoCoreError) as e:
+            raise TableError("Failed to update table: {0}".format(e))
 
     def list_tables(self, exclusive_start_table_name=None, limit=None):
         """
@@ -394,10 +400,10 @@ class Connection(object):
             operation_kwargs.update({
                 pythonic(LIMIT): limit
             })
-        response, data = self.dispatch(LIST_TABLES, operation_kwargs)
-        if not response.ok:
-            raise TableError("Unable to list tables: {0}".format(response.content))
-        return data
+        try:
+            return self.dispatch(LIST_TABLES, operation_kwargs)
+        except (ClientError, BotoCoreError) as e:
+            raise TableError("Unable to list tables: {0}".format(e))
 
     def describe_table(self, table_name):
         """
@@ -586,10 +592,10 @@ class Connection(object):
             operation_kwargs.update(self.get_item_collection_map(return_item_collection_metrics))
         if conditional_operator:
             operation_kwargs.update(self.get_conditional_operator(conditional_operator))
-        response, data = self.dispatch(DELETE_ITEM, operation_kwargs)
-        if not response.ok:
-            raise DeleteError("Failed to delete item: {0}".format(response.content))
-        return data
+        try:
+            return self.dispatch(DELETE_ITEM, operation_kwargs)
+        except (ClientError, BotoCoreError) as e:
+            raise DeleteError("Failed to delete item: {0}".format(e))
 
     def update_item(self,
                     table_name,
@@ -634,10 +640,10 @@ class Connection(object):
                     attr_type: value
                 }
             }
-        response, data = self.dispatch(UPDATE_ITEM, operation_kwargs)
-        if not response.ok:
-            raise UpdateError("Failed to update item: {0}".format(response.content))
-        return data
+        try:
+            return self.dispatch(UPDATE_ITEM, operation_kwargs)
+        except (ClientError, BotoCoreError) as e:
+            raise UpdateError("Failed to update item: {0}".format(e))
 
     def put_item(self,
                  table_name,
@@ -667,10 +673,10 @@ class Connection(object):
             operation_kwargs.update(self.get_expected_map(table_name, expected))
         if conditional_operator:
             operation_kwargs.update(self.get_conditional_operator(conditional_operator))
-        response, data = self.dispatch(PUT_ITEM, operation_kwargs)
-        if not response.ok:
-            raise PutError("Failed to put item: {0}".format(response.content))
-        return data
+        try:
+            return self.dispatch(PUT_ITEM, operation_kwargs)
+        except (ClientError, BotoCoreError) as e:
+            raise PutError("Failed to put item: {0}".format(e))
 
     def batch_write_item(self,
                          table_name,
@@ -705,10 +711,10 @@ class Connection(object):
                     DELETE_REQUEST: self.get_item_attribute_map(table_name, item, item_key=KEY, pythonic_key=False)
                 })
         operation_kwargs[pythonic(REQUEST_ITEMS)][table_name] = delete_items_list + put_items_list
-        response, data = self.dispatch(BATCH_WRITE_ITEM, operation_kwargs)
-        if not response.ok:
-            raise PutError("Failed to batch write items: {0}".format(response.content))
-        return data
+        try:
+            return self.dispatch(BATCH_WRITE_ITEM, operation_kwargs)
+        except (ClientError, BotoCoreError) as e:
+            raise PutError("Failed to batch write items: {0}".format(e))
 
     def batch_get_item(self,
                        table_name,
@@ -740,10 +746,10 @@ class Connection(object):
                 self.get_item_attribute_map(table_name, key)[pythonic(ITEM)]
             )
         operation_kwargs[pythonic(REQUEST_ITEMS)][table_name].update(keys_map)
-        response, data = self.dispatch(BATCH_GET_ITEM, operation_kwargs)
-        if not response.ok:
-            raise GetError("Failed to batch get items: {0}".format(response.content))
-        return data
+        try:
+            return self.dispatch(BATCH_GET_ITEM, operation_kwargs)
+        except (ClientError, BotoCoreError) as e:
+            raise GetError("Failed to batch get items: {0}".format(e))
 
     def get_item(self,
                  table_name,
@@ -760,10 +766,10 @@ class Connection(object):
         operation_kwargs[pythonic(CONSISTENT_READ)] = consistent_read
         operation_kwargs[pythonic(TABLE_NAME)] = table_name
         operation_kwargs.update(self.get_identifier_map(table_name, hash_key, range_key))
-        response, data = self.dispatch(GET_ITEM, operation_kwargs)
-        if not response.ok:
-            raise GetError("Failed to get item: {0}".format(response.content))
-        return data
+        try:
+            return self.dispatch(GET_ITEM, operation_kwargs)
+        except (ClientError, BotoCoreError) as e:
+            raise GetError("Failed to get item: {0}".format(e))
 
     def scan(self,
              table_name,
@@ -808,10 +814,10 @@ class Connection(object):
                     operation_kwargs[pythonic(SCAN_FILTER)][key][ATTR_VALUE_LIST] = values
             if conditional_operator:
                 operation_kwargs.update(self.get_conditional_operator(conditional_operator))
-        response, data = self.dispatch(SCAN, operation_kwargs)
-        if not response.ok:
-            raise ScanError("Failed to scan table: {0}".format(response.content))
-        return data
+        try:
+            return self.dispatch(SCAN, operation_kwargs)
+        except (ClientError, BotoCoreError) as e:
+            raise ScanError("Failed to scan table: {0}".format(e))
 
     def query(self,
               table_name,
@@ -887,8 +893,7 @@ class Connection(object):
                     ],
                     COMPARISON_OPERATOR: operator
                 }
-
-        response, data = self.dispatch(QUERY, operation_kwargs)
-        if not response.ok:
-            raise QueryError("Failed to query items: {0}".format(response.content))
-        return data
+        try:
+            return self.dispatch(QUERY, operation_kwargs)
+        except (ClientError, BotoCoreError) as e:
+            raise QueryError("Failed to query items: {0}".format(e))
