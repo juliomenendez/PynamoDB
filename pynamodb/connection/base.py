@@ -247,7 +247,7 @@ class Connection(object):
         """
         Returns a reference to the dynamodb client
         """
-        return self.session.create_client(SERVICE_NAME, region_name=self.region)
+        return self.session.create_client(SERVICE_NAME, region_name=self.region, endpoint_url=self.host)
 
     @property
     def service(self):
